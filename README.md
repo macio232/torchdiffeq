@@ -1,3 +1,6 @@
+Fork of the original repository [torchdiffeq](https://github.com/rtqichen/torchdiffeq)
+with improved mini-batching for `odeint_event`. `odeint_adjoint` is NOT WORKING in this setting.
+
 # PyTorch Implementation of Differentiable ODE Solvers
 
 This library provides ordinary differential equation (ODE) solvers implemented in PyTorch. Backpropagation through ODE solutions is supported using the adjoint method for constant memory cost. For usage of ODE solvers in deep learning applications, see reference [1].
