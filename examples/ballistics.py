@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
+from types import MappingProxyType
+from typing import Literal
+
 import argparse
 import math
 
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
 
-from torchdiffeq import odeint, odeint_adjoint
+from torchdiffeq import odeint
 from torchdiffeq import odeint_event
 
-torch.set_default_dtype(torch.float64)
+torch.set_default_dtype(torch.float32)
 
 
 def linspace(start, stop, N, endpoint=True):
@@ -23,132 +27,225 @@ def linspace(start, stop, N, endpoint=True):
 
 
 class Ballistics(nn.Module):
-    def __init__(self, k=0.25, m=0.2, g=9.81, adjoint=False):
+    def __init__(
+        self,
+        k=0.25,
+        m=0.2,
+        g=9.81,
+        method="euler",
+        method_options=MappingProxyType({"step_size": 0.01}),
+        event_options=MappingProxyType({}),
+        y_type: Literal["implicit", "explicit"] = "implicit",
+    ):
         super().__init__()
+        self.y_type = y_type
         self.k = k
         self.m = m
         self.g = g
-        self.t0 = nn.Parameter(torch.tensor([0.0]))
-        self.odeint = odeint_adjoint if adjoint else odeint
+        self.t0 = nn.Parameter(torch.tensor([0.0]), requires_grad=False)
+        self.odeint = odeint
+        self.method = method
+        self.event_options = event_options
+        if "dtype" in method_options:
+            self.method_options = dict(**method_options)
+            self.method_options["dtype"] = getattr(
+                torch, self.method_options["dtype"]
+            )
+        else:
+            self.method_options = method_options
 
-    @staticmethod
-    def dposxdt(t, pos_x, pos_y, alpha, velocity, k, m, g):
-        return velocity * torch.cos(alpha) * torch.exp(-k * t / m)
+    def dposxdt(self, t, pos_x, pos_y, alpha, velocity, complete=None):
+        return velocity * torch.cos(alpha) * torch.exp(-self.k * t / self.m)
 
-    @staticmethod
-    def dposydt(t, pos_x, pos_y, alpha, velocity, k, m, g):
+    def dposydt(self, t, pos_x, pos_y, alpha, velocity, complete=None):
         return (
             1
-            / k
-            * torch.exp(-k * t / m)
-            * (k * velocity * torch.sin(alpha) - g * m * (torch.exp(k * t / m) - 1))
+            / self.k
+            * torch.exp(-self.k * t / self.m)
+            * (
+                self.k * velocity * torch.sin(alpha)
+                - self.g * self.m * (torch.exp(self.k * t / self.m) - 1)
+            )
         )
 
-    def trajectory(self, x, t):
-        pos_x, pos_y, alpha, velocity, _ = x.unsqueeze(-1).expand(-1, -1, t.shape[-1])
+    def trajectory(self, x, t, complete=None, both=True):
+        if t.dim() == 1 or t.dim() == 0:
+            pos_x, pos_y, alpha, velocity = x
+        elif t.dim() == 2:
+            pos_x, pos_y, alpha, velocity = x.unsqueeze(-1).expand(
+                -1, -1, t.shape[-1]
+            )
+        else:
+            raise ValueError(f"Too many dimensions for time: {t.dim()}")
+        velocity = velocity * 20
+        if both is True:
+            return (
+                self._trajectory_x(alpha, pos_x, t, velocity),
+                self._trajectory_y(alpha, pos_y, t, velocity),
+            )
+        elif both == "x":
+            return self._trajectory_x(alpha, pos_x, t, velocity)
+        elif both == "y":
+            return self._trajectory_y(alpha, pos_y, t, velocity)
+        else:
+            raise ValueError(f"Unknown trajectory setting {both}")
+
+    def _trajectory_y(self, alpha, pos_y, t, velocity):
+        return pos_y - self.m / self.k ** 2 * (
+            (self.g * self.m + velocity * torch.sin(alpha) * self.k)
+            * (torch.exp(-self.k * t / self.m) - 1)
+            + self.g * t * self.k
+        )
+
+    def _trajectory_x(self, alpha, pos_x, t, velocity):
         return (
             pos_x
             - velocity
             * torch.cos(alpha)
             * self.m
             / self.k
-            * (torch.exp(-self.k * t / self.m) - 1),
-            pos_y
-            - self.m
-            / self.k ** 2
-            * (
-                (self.g * self.m + velocity * torch.sin(alpha) * self.k)
-                * (torch.exp(-self.k * t / self.m) - 1)
-                + self.g * t * self.k
-            ),
-        )
+            * (torch.exp(-self.k * t / self.m) - 1)
+        ) / 10
 
-    def grad(self, t, state):
+    def grad(self, t, state, complete=None):
         pos_x, pos_y, alpha, velocity, event_t = state
         grad = torch.stack(
             (
-                self.dposxdt(t, pos_x, pos_y, alpha, velocity, self.k, self.m, self.g),
-                self.dposydt(t, pos_x, pos_y, alpha, velocity, self.k, self.m, self.g),
+                self.dposxdt(
+                    t,
+                    pos_x,
+                    pos_y,
+                    alpha,
+                    velocity,
+                    complete=complete,
+                ),
+                self.dposydt(
+                    t,
+                    pos_x,
+                    pos_y,
+                    alpha,
+                    velocity,
+                    complete=complete,
+                ),
                 torch.zeros_like(alpha),
                 torch.zeros_like(velocity),
                 torch.zeros_like(event_t),
             )
         )
-        grad[:, event_t.nonzero()] = 0
-        return grad
-
-    def event_fn(self, t, state):
-        pos_x, pos_y, alpha, velocity, event_t = state
         return torch.where(
-            self.dposydt(t, pos_x, pos_y, alpha, velocity, self.k, self.m, self.g) < 0,
-            torch.where(event_t == 0, pos_y, torch.tensor(1.0)),
-            torch.tensor(1.0),
+            event_t == 0, grad, torch.tensor(0.0, device=state.device)
         )
 
-    def get_initial_state(self, x):
-        return self.t0, x
-
-    def update_satate(self, state, idx, event_t):
-        state[-1, idx] = event_t
-        return state
-
-    def get_collision_times(self, x):
-
-        event_t, solution = self.get_initial_state(x)
-
-        while not (solution[-1, :] != 0).all():
-            event_t, solution = odeint_event(
-                self.grad,
-                solution,
-                event_t,
-                event_fn=self.event_fn,
-                reverse_time=False,
-                atol=1e-8,
-                rtol=1e-8,
-                odeint_interface=self.odeint,
+    def event_fn(self, t, state, complete=None):
+        pos_x, pos_y, alpha, velocity, event_t = state
+        return torch.where(
+            self.dposydt(
+                t,
+                pos_x,
+                pos_y,
+                alpha,
+                velocity,
+                complete=complete,
             )
-            solution = self.update_satate(
-                solution[-1], self.event_fn(event_t, solution[-1]).argmin(), event_t
-            )
+            <= 0,
+            torch.where(
+                event_t == 0, pos_y, torch.tensor(1000.0, device=state.device)
+            ),
+            torch.tensor(1000.0, device=state.device),
+        ).unsqueeze(0)
 
-        return solution[-1, :]
-    
+    def get_initial_state(self, x, complete=None):
+        return self.t0, torch.cat(
+            (
+                x[:3, :],
+                x[3:4, :] * 20,
+                torch.zeros(
+                    1,
+                    x.shape[-1],
+                    device=x.device,
+                    requires_grad=x.requires_grad,
+                ),
+            ),
+            dim=0,
+        )
+
+    def update_state(self, state, mask, event_t, complete=None):
+        return torch.cat(
+            (
+                state[:-1, :],
+                torch.where(mask, event_t, state[-1, :]).unsqueeze(0),
+            ),
+            dim=0,
+        )
+
+    def get_initial_t(self, event_t, mask, complete=None):
+        return event_t[mask].mean()
+
+    def get_collision_times(self, x, complete=None):
+        return self._run_forward(x, complete=complete)[-1, :].T
+
     def get_y(self, x, complete=None):
-        event_t, solution = self.get_initial_state(x, complete=complete)
+        return self._run_forward(x, complete=complete)[0, :].T.unsqueeze(-1)
 
+    def _run_forward(self, x, complete=None):
+        t0, solution = self.get_initial_state(x, complete=complete)
+        event_t = None
+        pbar = tqdm(total=x.shape[-1], disable=True)
         while not (solution[-1, :] != 0).all():
-            event_t, solution = odeint_event(
-                self.grad,
+            if event_t is not None:
+                t0 = self.get_initial_t(
+                    event_t, solution[-1, :] == 0, complete=complete
+                )
+            event_t, solution, location = odeint_event(
+                lambda t, state: self.grad(t, state, complete=complete),
                 solution,
-                event_t,
-                event_fn=self.event_fn,
+                t0,
+                event_fn=lambda t, state: self.event_fn(
+                    t, state, complete=complete
+                ),
                 reverse_time=False,
-                atol=1e-8,
-                rtol=1e-8,
+                **self.event_options,
                 odeint_interface=self.odeint,
+                options=self.method_options,
+                method=self.method,
             )
-            solution = self.update_satate(
-                solution[-1], self.event_fn(event_t, solution[-1]).argmin(), event_t
+            pbar.update(location.sum().item())
+            solution = self.update_state(
+                solution[-1],
+                location,
+                event_t,
+                complete=complete,
             )
 
-        return solution[0, :]
-    
+        pbar.close()
+        return torch.cat((solution[:1, :] / 10, solution[1:, :]), dim=0)
+
     def forward(self, x, complete=None, trajectories=False):
         if trajectories:
-            return self.simulate(x, complete=complete)
+            return self.simulate(x.T, complete=complete)
         else:
-            return self.get_y(x, complete=complete)
-        
+            if self.y_type == "implicit":
+                return self.get_y(x.T, complete=complete)
+            elif self.y_type == "explicit":
+                return self.trajectory(
+                    x.T,
+                    self.get_collision_times(x.T, complete=complete),
+                    both="x",
+                ).unsqueeze(-1)
+            else:
+                raise ValueError(f"Unknown y computation type: {self.y_type}")
 
-    def simulate(self, x):
-        event_times = self.get_collision_times(x)
+    def simulate(self, x, complete=None):
+        event_times = self.get_collision_times(x, complete=complete)
 
         tt = linspace(
-            torch.zeros(1).expand(event_times.size()),
+            torch.zeros(1, device=event_times.device).expand(
+                event_times.size()
+            ),
             event_times,
             int((float(event_times.max()) - 0) * 50),
         )
-        positions_x, positions_y = self.trajectory(x, tt)
+        positions_x, positions_y = self.trajectory(x, tt, complete=complete)
         return (
             tt,
             positions_x,
@@ -165,7 +262,7 @@ if __name__ == "__main__":
     msd0 = (0, 0.25)
     msd1 = (1.5, 0.25)
     int2 = (9, 72)
-    lambda3 = 30
+    lambda3 = 15
     x = torch.tensor(
         torch.cat(
             (
@@ -174,18 +271,19 @@ if __name__ == "__main__":
                 (torch.rand(n_samples, 1) * (int2[1] - int2[0]) + int2[0])
                 * math.pi
                 / 180,
-                torch.poisson(torch.ones(n_samples, 1) * lambda3),
-                torch.zeros(n_samples, 1)
+                torch.poisson(torch.ones(n_samples, 1) * lambda3) / 20,
             ),
             dim=-1,
         ),
         requires_grad=True,
-    ).T
+    )
 
     system = Ballistics()
-    times, positions_x, positions_y, = system.simulate(
-        x=x,
-    )
+    (
+        times,
+        positions_x,
+        positions_y,
+    ) = system.forward(x=x, trajectories=True)
     n_plots = n_samples
 
     positions_x = positions_x.detach().cpu().numpy()

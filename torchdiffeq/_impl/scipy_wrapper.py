@@ -5,11 +5,10 @@ from .misc import _handle_unused_kwargs
 
 
 class ScipyWrapperODESolver(metaclass=abc.ABCMeta):
-
     def __init__(self, func, y0, rtol, atol, solver="LSODA", **unused_kwargs):
-        unused_kwargs.pop('norm', None)
-        unused_kwargs.pop('grid_points', None)
-        unused_kwargs.pop('eps', None)
+        unused_kwargs.pop("norm", None)
+        unused_kwargs.pop("grid_points", None)
+        unused_kwargs.pop("eps", None)
         _handle_unused_kwargs(self, unused_kwargs)
         del unused_kwargs
 
@@ -41,7 +40,6 @@ class ScipyWrapperODESolver(metaclass=abc.ABCMeta):
 
 
 def convert_func_to_numpy(func, shape, device, dtype):
-
     def np_func(t, y):
         t = torch.tensor(t).to(device, dtype)
         y = torch.reshape(torch.tensor(y).to(device, dtype), shape)
