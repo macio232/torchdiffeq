@@ -57,6 +57,7 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
         grid_constructor=None,
         interp="linear",
         perturb=False,
+        max_iter=20000,
         **unused_kwargs,
     ):
         self.atol = unused_kwargs.pop("atol")
@@ -72,6 +73,7 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
         self.step_size = step_size
         self.interp = interp
         self.perturb = perturb
+        self.max_iter = max_iter
 
         if step_size is None:
             if grid_constructor is None:
@@ -148,7 +150,6 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
         dt = self.step_size
 
         sign0 = torch.sign(event_fn(t0, y0))
-        max_itrs = 20000
         itr = 0
         while True:
             itr += 1
@@ -175,8 +176,8 @@ class FixedGridODESolver(metaclass=abc.ABCMeta):
             else:
                 t0, y0 = t1, y1
 
-            if itr >= max_itrs:
-                raise RuntimeError(f"Reached maximum number of iterations {max_itrs}.")
+            if itr >= self.max_iter:
+                raise RuntimeError(f"Reached maximum number of iterations {self.max_iter}.")
         solution = torch.stack([self.y0, y1], dim=0)
         return event_time, solution, location
 
