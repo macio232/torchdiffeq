@@ -6,3 +6,5 @@
 .vscode
 build
 dist
+.idea/
+*.png
